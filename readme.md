@@ -38,10 +38,6 @@ vllm serve Qwen/Qwen2.5-Coder-3B-Instruct \
   --gpu-memory-utilization 0.8 \
   --api-key token-abc123
 ```
-📁 Štruktúra projektu
-
-agents_vllm.py      # hlavný multi-agent orchestrátor
-tests/              # Python testy + run-tests.py
 
 V agents_vllm.py uprav tieto cesty:
 
@@ -51,11 +47,13 @@ MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
 
 ▶️ Spustenie agentov
 
+```bash
 cd <repo>
 python3 -m venv venv
 source venv/bin/activate
 pip install openai
 python3 agents_vllm.py
+```
 
 Agent automaticky vykoná:
 
@@ -74,7 +72,9 @@ Agent automaticky vykoná:
 🧩 Zmena zadania
 
 Text úlohy je definovaný v súbore:
+```bash
 PROBLEM = "..."
+```
 Prepíš obsah a agent vytvorí nový program.
 
 🎉 Výsledok

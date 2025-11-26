@@ -10,10 +10,10 @@ print(">>> agents_vllm.py sa NAČÍTAL")
 # ==========================
 
 # ROOT_DIR = kde bude main.c a binárka ./main
-ROOT_DIR = "" 
+ROOT_DIR = ""
 
 # TESTS_DIR = priečinok s run-tests.py a test-* adresármi
-TESTS_DIR = os.path.join(ROOT_DIR, "")
+TESTS_DIR = os.path.join(ROOT_DIR, "tests")
 
 SOURCE_NAME = "main.c"   # názov C súboru
 BINARY_NAME = "main"     # názov binárky (./main)
@@ -23,13 +23,16 @@ RUN_TESTS_SCRIPT = "run-tests.py"
 MAX_ITERATIONS = 10
 
 # Názov modelu, ktorý beží vo vLLM serveri
-MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct-AWQ"
 
-# Zadanie, ktoré má agent implementovať
-PROBLEM = """Problem"""
+# Zadanie – histogram
+PROBLEM = """ """
+
+# Stručné pripomenutie zadania pre opravné iterácie
+SHORT_SPEC_HINT = ()
 
 # ==========================
-# PRIPOJENIE NA vLLM (OpenAI API kompatibilný server)
+# PRIPOJENIE NA vLLM
 # ==========================
 
 client = OpenAI(
@@ -37,38 +40,66 @@ client = OpenAI(
     api_key="token-abc123",
 )
 
+# ==========================
+# POMOCNÉ FUNKCIE
+# ==========================
+
+def truncate(text: str, max_chars: int) -> str:
+    """Oreže text na max_chars znakov, zvyšok označí ako TRUNCATED."""
+    if text is None:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n...[TRUNCATED]...\n"
+
 
 def call_agent(role: str, goal: str, message: str) -> str:
     """
     Zavolá jedného agenta s danou rolou a cieľom cez vLLM server.
     """
     print(f">>> Volám agenta: {role}")
-    system_prompt = f"Si agent s rolou: {role}. Tvoj cieľ: {goal}."
+    system_prompt = (
+        f"Si agent s rolou: {role}. Tvoj cieľ: {goal}.\n"
+        "Pri odpovedi dodrž tieto pravidlá:\n"
+        "- Vráť len čistý C kód (žiadny Markdown, žiadne ``` bloky).\n"
+        "- Nepíš žiadne vysvetlenia, komentáre ani text mimo C kódu.\n"
+    )
     completion = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ],
+        temperature=0.1,   # menej kreativity, viac stability
+        top_p=0.9,
+        max_tokens=1200,
     )
     return completion.choices[0].message.content
 
-
-# ==========================
-# POMOCNÉ FUNKCIE PRE KÓD
-# ==========================
 
 def extract_c_code(response: str) -> str:
     """
     Ak LLM vráti kód v ```c ... ``` bloku, vytiahne len obsah.
     Inak vráti celý text ako kód.
     """
-    fence_match = re.search(r"```(?:c|C|cpp|C\\+\\+)?\\s*(.*?)```", response, re.DOTALL)
+    fence_match = re.search(
+        r"```(?:c|C|cpp|C\+\+)?\s*(.*?)```",
+        response,
+        re.DOTALL
+    )
     if fence_match:
         code = fence_match.group(1).strip()
         print(">>> Z odpovede som vytiahol kód z ``` blokov.")
         return code
-    print(">>> Celá odpoveď sa berie ako kód (žiadne ``` bloky).")
+
+    if "```" in response:
+        parts = response.split("```")
+        if len(parts) >= 3:
+            code = parts[1]
+            print(">>> Fallback: vytiahol som druhý úsek medzi ```.")
+            return code.strip()
+
+    print(">>> Celá odpoveď sa berie ako kód (žiadne rozpoznané ``` bloky).")
     return response.strip()
 
 
@@ -106,37 +137,46 @@ def run_python_tests() -> tuple[bool, str, str]:
     Spustí python testy: python3 run-tests.py ../main v TESTS_DIR.
 
     Vráti:
-      - success (bool) – či run-tests skončil s returncode 0
-      - stdout (str) – výpis testov
-      - stderr (str) – prípadné chyby z run-tests
+      - success (bool)
+      - stdout (str)
+      - stderr (str)
     """
     print(">>> Spúšťam python testy (run-tests.py)...")
-    proc = subprocess.run(
-        ["python3", RUN_TESTS_SCRIPT, f"../{BINARY_NAME}"],
-        cwd=TESTS_DIR,
-        capture_output=True,
-        text=True,
-    )
-    success = proc.returncode == 0
-    return success, proc.stdout, proc.stderr
+    try:
+        proc = subprocess.run(
+            ["python3", RUN_TESTS_SCRIPT, f"../{BINARY_NAME}"],
+            cwd=TESTS_DIR,
+            capture_output=True,
+            text=True,
+            timeout=5.0,  # 5 sekúnd na všetky testy
+        )
+        success = proc.returncode == 0
+        return success, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        print("!!! run-tests.py prekročil časový limit (timeout)")
+        stdout = e.stdout or ""
+        stderr = (e.stderr or "") + "\n[TIMEOUT: run-tests.py alebo ./main sa neukončili v limite]"
+        return False, stdout, stderr
 
 
-def collect_stdout_differences(max_chars: int = 400) -> str:
+def collect_stdout_differences(max_chars: int = 400):
     """
     Prejde všetky podpriečinky v TESTS_DIR a hľadá páry:
 
       TESTS_DIR/test-XXX/stdout
       TESTS_DIR/test-XXX/workdir/actual-stdout
 
-    a porovná ich obsah. Keď sú rozdielne, pridá ich do reportu.
+    a porovná ich obsah. Keď sú rozdielne, vráti zoznam dvojíc
+    (test_name, diff_text). Ak je všetko OK, vráti [].
     """
     print(">>> Hľadám rozdiely medzi stdout a actual-stdout v testoch...")
     diffs = []
     if not os.path.isdir(TESTS_DIR):
         print(f"!!! TESTS_DIR neexistuje alebo nie je adresár: {TESTS_DIR}")
-        return ""
+        return []
 
-    for entry in os.scandir(TESTS_DIR):
+    # Aby to šlo pekne po poradí test-001, test-002, ...
+    for entry in sorted(os.scandir(TESTS_DIR), key=lambda e: e.name):
         if not entry.is_dir():
             continue
         test_dir = entry.path
@@ -151,20 +191,28 @@ def collect_stdout_differences(max_chars: int = 400) -> str:
             actual = f.read()
 
         if expected != actual:
-            exp_short = (expected[:max_chars] + "...\n[TRUNCATED]") if len(expected) > max_chars else expected
-            act_short = (actual[:max_chars] + "...\n[TRUNCATED]") if len(actual) > max_chars else actual
+            exp_short = (
+                expected[:max_chars] + "...\n[TRUNCATED]"
+                if len(expected) > max_chars else expected
+            )
+            act_short = (
+                actual[:max_chars] + "...\n[TRUNCATED]"
+                if len(actual) > max_chars else actual
+            )
 
-            diffs.append(
+            diff_text = (
                 f"Test: {os.path.basename(test_dir)}\n"
                 f"OČAKÁVANÝ stdout:\n{exp_short}\n\n"
                 f"AKTUÁLNY stdout:\n{act_short}\n"
             )
+            diffs.append((os.path.basename(test_dir), diff_text))
 
     if not diffs:
         print(">>> Žiadne rozdiely stdout vs actual-stdout som nenašiel.")
-        return ""
-    print(">>> Našiel som rozdiely v stdout/actual-stdout.")
-    return "\n\n".join(diffs)
+        return []
+
+    print(f">>> Našiel som rozdiely v stdout/actual-stdout (počet: {len(diffs)}).")
+    return diffs
 
 
 # ==========================
@@ -178,6 +226,7 @@ def main():
     print("MODEL_NAME =", MODEL_NAME)
 
     feedback_for_programmer = ""
+    last_code = ""  # aktuálna verzia main.c, ktorú bude model opravovať
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         print("\n==============================")
@@ -187,22 +236,24 @@ def main():
         # ---------- PROGRAMÁTOR AGENT ----------
         if iteration == 1:
             programmer_message = (
-                "Tu je zadanie programu v jazyku C:\n"
+                "Tu je zadanie programu v jazyku C (histogram čísel):\n"
                 f"{PROBLEM}\n\n"
-                "Napíš kompletný, kompilovateľný C program. "
-                "Kód bude uložený v súbore main.c v ROOT_DIR a kompilovaný na binárku ./main. "
-                "Testy sa spúšťajú v podpriečinku s run-tests.py pomocou 'python3 run-tests.py ../main'. "
-                "Vráť len C kód, bez vysvetlení."
+                "Napíš kompletný, kompilovateľný C program v jednom súbore main.c.\n"
+                "- Súbor sa bude kompilovať na binárku ./main pomocou gcc -std=c99.\n"
+                "- Testy sa spúšťajú z podpriečinka tests pomocou 'python3 run-tests.py ../main'.\n\n"
+                "DÔLEŽITÉ:\n"
+                "- Vráť len čistý C kód, bez Markdownu, bez ``` blokov, bez vysvetlení a komentárov navyše.\n"
             )
         else:
             programmer_message = (
-                "Tu je pôvodné zadanie programu v jazyku C:\n"
-                f"{PROBLEM}\n\n"
-                "Predchádzajúca verzia kódu neprešla kompiláciou alebo testami.\n"
-                "Tu je spätná väzba (chyby kompilácie a/nebo rozdiely v testoch):\n"
-                f"{feedback_for_programmer}\n\n"
-                "Na základe toho oprav program a vráť NOVÚ kompletnú verziu súboru main.c. "
-                "Vráť len C kód, bez vysvetlení."
+                f"{SHORT_SPEC_HINT}\n\n"
+                "Tu je aktuálna verzia programu main.c, ktorá má chyby (skrátená, ak je dlhá):\n\n"
+                f"{truncate(last_code, 4000)}\n\n"
+                "Tu je stručná spätná väzba z kompilácie/testov (skrátená):\n\n"
+                f"{truncate(feedback_for_programmer, 2000)}\n\n"
+                "Oprav TENTO kód minimálnymi zmenami tak, aby spĺňal zadanie a prešiel testami.\n"
+                "Nemeň funkčné časti zbytočne, snaž sa len opravovať chyby.\n"
+                "Vráť novú kompletnú verziu súboru main.c (čistý C kód, bez Markdownu a vysvetlení).\n"
             )
 
         print(">>> Idem volať PROGRAMÁTORA agenta...")
@@ -212,6 +263,7 @@ def main():
             message=programmer_message,
         )
         code = extract_c_code(code_raw)
+        last_code = code  # uložíme si aktuálnu verziu pre ďalšiu iteráciu
         save_code_to_root_dir(code)
 
         # ---------- KOMPILÁCIA ----------
@@ -222,26 +274,11 @@ def main():
             print(compiler_stderr)
             print("----------------------------------------")
 
-            tester_message = (
-                "Toto je C kód z main.c, ktorý neprešiel kompiláciou:\n\n"
-                f"{code}\n\n"
-                "A toto je výpis chýb z gcc:\n\n"
-                f"{compiler_stderr}\n\n"
-                "1) Zrekapituluj hlavné chyby.\n"
-                "2) Navrhni konkrétne úpravy kódu (popíš, čo zmeniť).\n"
-                "3) Priprav stručné inštrukcie pre programátora, aby to v ďalšej iterácii opravil."
-            )
-            tester_feedback = call_agent(
-                role="Tester / C expert",
-                goal="Analyzuj chyby kompilácie a vysvetli, čo treba v kóde opraviť.",
-                message=tester_message,
-            )
-
             feedback_for_programmer = (
-                "CHYBY KOMPILÁTORA gcc:\n"
-                f"{compiler_stderr}\n\n"
-                "ANALÝZA OD TESTERA:\n"
-                f"{tester_feedback}\n"
+                "Tento C program neprešiel kompiláciou.\n\n"
+                "Skrátený výpis chýb z gcc (NEUPRAVUJ ho, len podľa neho oprav kód):\n\n"
+                f"{truncate(compiler_stderr, 1500)}\n\n"
+                "Oprav program tak, aby sa dal skompilovať bez chýb a zároveň zachoval špecifikáciu histogramu.\n"
             )
             continue  # ďalšia iterácia – nový kód
 
@@ -259,48 +296,58 @@ def main():
             print(tests_stderr)
             print("----------------------------------------")
 
-        # Porovnanie stdout vs actual-stdout
-        diff_text = collect_stdout_differences()
+        # Porovnanie stdout vs actual-stdout – zoznam diffov
+        diffs = collect_stdout_differences()
 
-        if tests_ok and not diff_text:
+        if tests_ok and not diffs:
             print("🎉 VŠETKY TESTY PREŠLI a stdout sa zhoduje s očakávaným.")
             print(f"Finálny binárny súbor: {os.path.join(ROOT_DIR, BINARY_NAME)}")
             break
         else:
             print("⚠️ Niektoré testy NEPREŠLI alebo stdout sa nezhoduje.")
-            if diff_text:
-                print(">>> Rozdiely medzi očakávaným a aktuálnym výstupom:")
-                print(diff_text)
 
-            # ---------- TESTOVACÍ AGENT ----------
-            test_agent_message = (
-                "Máme C program, ktorý sa síce skompiloval, ale neprešiel všetkými testami.\n\n"
-                "Výstup z run-tests.py (stdout):\n"
-                f"{tests_stdout}\n\n"
-                "Prípadné chybové hlášky z run-tests.py (stderr):\n"
-                f"{tests_stderr}\n\n"
-                "Rozdiely medzi očakávaným a aktuálnym stdout v jednotlivých testoch:\n"
-                f"{diff_text if diff_text else '[Žiadne konkrétne diffy neboli nájdené.]'}\n\n"
-                "1) Vysvetli, v čom program nesplnil očakávania.\n"
-                "2) Navrhni, čo konkrétne v kóde treba zmeniť (logika, parsovanie argumentov, formát výstupu atď.).\n"
-                "3) Priprav inštrukcie pre programátora, aby vedel program opraviť tak, aby testy prešli."
-            )
+            first_test_name, first_diff = None, ""
+            if diffs:
+                print(">>> Rozdiely medzi očakávaným a aktuálnym výstupom (všetky):")
+                for test_name, diff_text in diffs:
+                    print("----------")
+                    print(diff_text)
 
-            test_agent_feedback = call_agent(
-                role="Testovací agent",
-                goal="Analyzuj výsledky testov a navrhni, ako upraviť program, aby testy prešli.",
-                message=test_agent_message,
-            )
+                # Fókus len na prvý neúspešný test
+                first_test_name, first_diff = diffs[0]
+                print(f">>> Fokujeme sa na prvý neúspešný test: {first_test_name}")
+
+            timeout_hint = ""
+            if "[TIMEOUT" in (tests_stderr or ""):
+                timeout_hint = (
+                    "Poznámka: Program sa počas spúšťania testov neukončil v časovom limite.\n"
+                    "Pravdepodobne obsahuje nekonečný cyklus alebo nesprávne čítanie vstupu.\n"
+                    "Skontroluj hlavne:\n"
+                    "- či čítaš presne n čísel (for (int i = 0; i < n; i++)),\n"
+                    "- podmienky cyklov (while/for),\n"
+                    "- korektné ukončenie programu po spracovaní vstupu.\n\n"
+                )
+
+            target_test_info = ""
+            if first_test_name:
+                target_test_info = (
+                    f"Oprav najprv tento konkrétny test: {first_test_name}.\n"
+                    "Keď bude tento test prechádzať, ďalšie iterácie sa môžu sústrediť na ďalšie testy.\n\n"
+                    "Rozdiel očakávaného a aktuálneho výstupu pre tento test:\n"
+                    f"{truncate(first_diff, 1500)}\n\n"
+                )
 
             feedback_for_programmer = (
-                "VÝSLEDKY TESTOV (run-tests.py stdout):\n"
-                f"{tests_stdout}\n\n"
-                "CHYBY TESTOV (stderr):\n"
-                f"{tests_stderr}\n\n"
-                "ROZDIELY stdout vs actual-stdout:\n"
-                f"{diff_text}\n\n"
-                "ANALÝZA OD TESTOVACIEHO AGENTA:\n"
-                f"{test_agent_feedback}\n"
+                "Program sa skompiloval, ale neprešiel všetkými testami\n"
+                "alebo jeho výstup nesedí s očakávaným.\n\n"
+                f"{timeout_hint}"
+                f"{target_test_info}"
+                "Skrátený výstup z run-tests.py (stdout):\n"
+                f"{truncate(tests_stdout, 800)}\n\n"
+                "Skrátené chybové hlášky z run-tests.py (stderr):\n"
+                f"{truncate(tests_stderr, 600)}\n\n"
+                "Na základe týchto informácií uprav C program tak, aby tento test prešiel,\n"
+                "a zároveň zachoval špecifikáciu programu (histogram s 9 košmi, formát vstupu/výstupu).\n"
             )
 
     else:

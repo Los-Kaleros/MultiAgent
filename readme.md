@@ -6,8 +6,8 @@ Ak sa `actual-stdout` nezhoduje s `stdout`, agent kód upraví a cyklus zopakuje
 ---
 
 ## 🔧 Požiadavky
-- Linux (odporúčaný Linux Mint)
-- NVIDIA GPU (napr. RTX 3070)
+- Linux
+- NVIDIA GPU
 - Python 3.10+
 - gcc
 - vLLM + kompatibilný model (napr. Qwen2.5 Coder 3B Instruct)
